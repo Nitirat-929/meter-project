@@ -1,6 +1,6 @@
 import streamlit as st
 from pyzbar.pyzbar import decode
-from PIL import Image, UnidentifiedImageError, ImageEnhance
+from PIL import Image, UnidentifiedImageError, ImageEnhance, ImageOps
 import requests
 from requests.exceptions import RequestException
 from io import BytesIO
@@ -10,41 +10,60 @@ import numpy as np
 import base64
 
 # ==========================================
-# 1. ฟังก์ชัน Logic (อยู่บนสุดเหมือนเดิม)
+# 1. ฟังก์ชัน Logic (แก้ไส้ในใหม่ให้อ่านบาร์โค้ดโหดขึ้น)
 # ==========================================
 def process_image_logic(img, reader_obj):
-    # --- เตรียมภาพ ---
-    max_dim = 1200
+    # --- เตรียมภาพ (Resize) ---
+    max_dim = 1500 # เพิ่มความละเอียดขึ้นหน่อยเผื่อบาร์โค้ดเล็ก
     if max(img.size) > max_dim:
         img.thumbnail((max_dim, max_dim), Image.Resampling.LANCZOS)
 
+    # แปลงเป็นขาวดำ
     gray = img.convert('L')
+
+    # --- สร้างภาพหลายเวอร์ชั่นเพื่อดักจับบาร์โค้ด (สูตรแก้บาร์โค้ดตายยาก) ---
+    images_to_check = []
+    
+    # 1. ภาพ Original ขาวดำ
+    images_to_check.append(gray)
+    
+    # 2. ภาพ Auto Contrast (แก้แสงจ้า/มืดเกิน)
+    auto = ImageOps.autocontrast(gray)
+    images_to_check.append(auto)
+    
+    # 3. ภาพ High Contrast (เข้มจัด)
     enhancer = ImageEnhance.Contrast(gray)
-    high_contrast = enhancer.enhance(2.0)
-    binary = gray.point(lambda x: 0 if x < 100 else 255, '1')
+    high_contrast = enhancer.enhance(2.5) # เพิ่มเป็น 2.5
+    images_to_check.append(high_contrast)
+    
+    # 4. ภาพ Binary (Threshold แบบ Adaptive - ช่วยภาพที่มีเงาบัง)
+    # ใช้ numpy ช่วยทำ Threshold แบบง่ายๆ แต่ได้ผลดีกว่า fix ค่า 100
+    np_img = np.array(gray)
+    thresh_val = np.mean(np_img) # ใช้ค่าเฉลี่ยแสงของภาพเป็นตัวตัด
+    binary = gray.point(lambda x: 0 if x < thresh_val - 20 else 255, '1')
+    images_to_check.append(binary)
 
-    images_to_check = [gray, high_contrast, binary]
-
-    # --- หมุนหา Barcode ---
-    angles = [0, -90, 90] 
-    for angle in angles:
-        for img_ver in images_to_check:
+    # --- วนลูปหมุนภาพ + สแกน Barcode ---
+    angles = [0, -90, 90, 180] # เพิ่ม 180 องศา (กลับหัว)
+    
+    for img_ver in images_to_check:
+        for angle in angles:
             if angle != 0:
                 rotated = img_ver.rotate(angle, expand=True)
             else:
                 rotated = img_ver
-                
+            
+            # ยิง Barcode
             decoded = decode(rotated)
             if decoded:
                 for d in decoded:
                     raw_val = d.data.decode('utf-8')
+                    # กรองขยะ: เอาเฉพาะที่ยาวเกิน 4 ตัว
                     if len(raw_val) >= 4:
-                        # คืนค่าแบบเรียบง่าย (เพื่อเอาไปทำ CSV ง่ายๆ)
-                        # ส่งค่ากลับ 2 ตัว: (เลขซีเรียล, ประเภทที่เจอแบบดิบๆ)
                         return raw_val, "Barcode"
 
-    # --- OCR ---
-    img_np = np.array(gray) 
+    # --- ถ้า Barcode ไม่เจอจริงๆ ให้ใช้ OCR (Logic เดิมของคุณ) ---
+    img_np = np.array(gray) # ใช้ภาพขาวดำปกติส่ง OCR
     ocr_res = reader_obj.readtext(img_np, detail=0) 
     
     candidates = []
@@ -52,7 +71,7 @@ def process_image_logic(img, reader_obj):
         clean = "".join(c for c in text if c.isalnum())
         if len(clean) >= 5:
             score = len(clean)
-            if clean.isdigit(): score += 20 
+            if clean.isdigit(): score += 50 # เพิ่มคะแนนตัวเลขให้เยอะขึ้น (จาก 20 เป็น 50)
             else: score += sum(c.isdigit() for c in clean)
             candidates.append((score, clean))
     
@@ -80,7 +99,7 @@ def load_ocr():
 reader = load_ocr()
 
 # ==========================================
-# 2. ส่วนหน้าจอ (UI)
+# 2. ส่วนหน้าจอ (UI เดิมเป๊ะๆ)
 # ==========================================
 st.set_page_config(page_title="Universal Barcode Reader", layout="wide")
 
@@ -89,9 +108,8 @@ col_title, col_clear = st.columns([3, 1])
 with col_title:
     st.title("🔍 ʙᴀʀᴄᴏᴅᴇ ʀᴇᴀᴅᴇʀ  ⛶")
 with col_clear:
-    st.write("") # ดันปุ่มลงมาหน่อย
+    st.write("") 
     st.write("")
-    # ปุ่มเคลียร์ข้อมูลทั้งหมด
     if st.button("🗑️ ล้างหน้าจอ (Clear All)", type="secondary", use_container_width=True):
         clear_data()
 
@@ -101,7 +119,6 @@ urls = []
 uploaded_files = []
 
 with tab1:
-    # ใช้ key เพื่อให้ session_state คุมค่าได้ (เวลา clear จะได้หาย)
     urls_input = st.text_area("วางลิงก์ภาพ (1 ลิงก์ต่อบรรทัด):", height=150, key="url_input")
     if urls_input.strip():
         urls = [url.strip() for url in urls_input.split('\n') if url.strip()]
@@ -116,7 +133,7 @@ if st.button("🚀 เริ่มประมวลผล", type="primary"):
     if total > 0:
         bar = st.progress(0)
         idx_count = 0
-        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/91.0.4472.124 Safari/537.36'}
+        headers = {'User-Agent': 'Mozilla/5.0'}
 
         # --- Process URL ---
         for url in urls:
@@ -125,20 +142,19 @@ if st.button("🚀 เริ่มประมวลผล", type="primary"):
                 img = Image.open(BytesIO(resp.content))
                 val, method_type = process_image_logic(img, reader)
                 
-                # จัดรูปแบบให้เหมือนไฟล์เก่าเป๊ะๆ
                 if method_type == "Barcode":
                     serial_display = f"{val} (Scan)"
                     method_display = "Barcode"
                 elif method_type == "OCR":
                     serial_display = f"{val} (OCR)"
-                    method_display = "OCR (Serial)" # หรือใช้แค่ OCR ตามชอบ
+                    method_display = "OCR (Serial)" 
                 else:
                     serial_display = "อ่านไม่ได้"
                     method_display = "-"
 
                 results.append({
                     "preview": image_to_base64(img.resize((50,50))),
-                    "ลำดับ": 0, # เดี๋ยวมา run number ทีหลัง
+                    "ลำดับ": 0,
                     "เลขซีเรียล": serial_display,
                     "วิธีที่ใช้": method_display,
                     "ลิงก์ภาพ": url
@@ -193,16 +209,12 @@ if st.button("🚀 เริ่มประมวลผล", type="primary"):
         # --- สร้าง DataFrame และจัดเรียง ---
         if results:
             df = pd.DataFrame(results)
-            # รันเลขลำดับใหม่ (1, 2, 3...)
             df['ลำดับ'] = range(1, len(df) + 1)
             
-            # เรียงคอลัมน์ให้เหมือนไฟล์ตัวอย่างเป๊ะๆ
-            # ลำดับ | เลขซีเรียล | วิธีที่ใช้ | ลิงก์ภาพ
             final_df = df[['ลำดับ', 'เลขซีเรียล', 'วิธีที่ใช้', 'ลิงก์ภาพ']]
 
             st.subheader("✅ ผลลัพธ์การอ่านค่า")
             
-            # โชว์ตารางในเว็บ (ขอแถมรูปตัวอย่างไว้ดูเล่นๆ แต่ไม่เอาลง CSV)
             display_df = df[['preview', 'ลำดับ', 'เลขซีเรียล', 'วิธีที่ใช้', 'ลิงก์ภาพ']]
             st.data_editor(
                 display_df,
@@ -214,7 +226,6 @@ if st.button("🚀 เริ่มประมวลผล", type="primary"):
                 use_container_width=True
             )
 
-            # ปุ่มโหลด CSV แบบ Clean
             csv = final_df.to_csv(index=False).encode('utf-8-sig')
             
             st.download_button(
